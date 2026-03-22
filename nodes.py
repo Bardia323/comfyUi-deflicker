@@ -20,7 +20,7 @@ class DeflickerFrames:
                 }),
                 "step_strength": ("FLOAT", {
                     "default": 1.5, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Step removal strength. 1 = full correction. Ignored in temporal_smoothing mode.",
+                    "tooltip": "Step detection sensitivity. 1 = full correction, >1 = catches smaller steps without drift. Ignored in temporal_smoothing mode.",
                 }),
                 "smooth_strength": ("FLOAT", {
                     "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,

@@ -40,10 +40,10 @@ The node outputs two images:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| **mode** | both | **both**: step removal first, then temporal smoothing (recommended). **step_removal**: instant correction of sharp latent space shifts only. **temporal_smoothing**: Gaussian window-based correction for random flicker only. |
+| **mode** | step_removal | **step_removal**: instant correction of sharp latent space shifts (recommended). **both**: step removal first, then temporal smoothing. **temporal_smoothing**: Gaussian window-based correction for random flicker only. |
 | **channels** | L | `L`: brightness only — preserves original colors. `LAB`: brightness + color correction. |
 | | | **Step Removal** |
-| `step_strength` | 1.2 | Step removal correction strength. 0 = off, 1 = full. Ignored in temporal_smoothing mode. |
+| `step_strength` | 1.5 | Step detection sensitivity. 0 = off, 1 = full correction, >1 = more sensitive detection (catches smaller steps) without brightness drift. Ignored in temporal_smoothing mode. |
 | | | **Temporal Smoothing** |
 | `smooth_strength` | 1.0 | Temporal smoothing strength. 0 = off, 1 = full, >1 = overcorrect. Ignored in step_removal mode. **Caution:** values above 1.5 may introduce artifacts. |
 | `smooth_window` | 25 | Temporal smoothing window in frames. Larger = more aggressive. Use 11–15 for mild flicker, 21–31 for heavy. Must be odd. Ignored in step_removal mode. |
@@ -62,7 +62,7 @@ The node runs up to four correction phases depending on mode:
 
 **Phase 0 — Step removal (when `mode` = step_removal or both)**
 
-Detects sharp brightness discontinuities (latent space shifts) by finding frame-to-frame brightness changes that significantly exceed the normal noise level. Applies instant cumulative gain correction to undo each step. Unlike temporal smoothing, this preserves the natural brightness trend — it only removes the discrete jumps. Works well for stabilized footage generated in chunks.
+Detects sharp brightness discontinuities (latent space shifts) by finding frame-to-frame brightness changes that significantly exceed the normal noise level. Applies affine correction (gain + contrast/gamma matching) to anchor all frames to the stable reference level before the first detected step. Unlike temporal smoothing, this preserves the natural brightness trend — it only removes the discrete jumps. With `step_strength > 1.0`, detection becomes more sensitive (catches smaller steps) without causing progressive brightness drift.
 
 **Phase 1 — Per-frame statistics correction (when `mode` = temporal_smoothing or both)**
 
@@ -82,8 +82,8 @@ Automatically detects black borders from stabilized/cropped footage (letterbox, 
 
 ## Tips
 
-- **Start with defaults** — they work well for most AI-generated video
-- **Use `step_removal` mode** for sharp latent space brightness shifts that temporal smoothing can't fix. Use `both` if you have both step shifts and random flicker.
+- **Start with defaults** — `step_removal` mode at strength 1.5 works well for most AI-generated video
+- **Use `both` mode** if you have both step shifts and random per-frame flicker. Step removal runs first, then temporal smoothing cleans up residual noise.
 - **Increase `smooth_window`** (e.g. 25–31) if flicker is still visible. For long sequences (200+ frames), values up to 101–201 can be useful.
 - **Increase `smooth_strength`** above 1.0 if temporal correction is not strong enough
 - **Set `smooth_drift` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
