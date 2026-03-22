@@ -117,27 +117,31 @@ def _remove_steps(
 ) -> torch.Tensor:
     """Remove step discontinuities (latent space shifts) from a channel.
 
-    Detects sharp frame-to-frame brightness jumps that stand out from the
-    normal motion noise, then applies cumulative gain correction to undo
-    them instantly. Unlike temporal smoothing, this preserves the natural
-    brightness trend — it only removes the discrete steps.
+    Detects sharp frame-to-frame jumps and applies affine correction
+    (gain + contrast/gamma) to anchor all frames to the stable reference
+    level measured before the first detected step.
+
+    strength <= 1.0: blend between original and fully corrected.
+    strength > 1.0: increases detection sensitivity (catches smaller steps)
+    without causing progressive brightness drift.
 
     Algorithm:
-    1. Compute per-frame means (masked).
-    2. Compute frame-to-frame diffs.
-    3. Detect outlier diffs (> threshold_mult × median abs diff).
-    4. Accumulate detected steps as a running correction.
-    5. Apply as per-frame gain: target / current.
+    1. Compute per-frame means AND stds (masked).
+    2. Compute frame-to-frame diffs for both stats.
+    3. Detect outlier mean diffs (> threshold / detection_boost).
+    4. Accumulate detected steps for mean and std as running corrections.
+    5. Apply gain (mean) + contrast scaling (gamma) per frame.
 
     Args:
         ch_data: [N, H, W] single channel data.
         content_mask: [H, W] bool mask. True = content pixel for stats.
         threshold_mult: Sensitivity — how many times the median abs diff
             counts as a step. Lower = more sensitive. Default 5.0.
-        strength: 0.0 = no correction, 1.0 = full step removal.
+        strength: 0.0 = no correction, 1.0 = full step removal,
+            >1.0 = more sensitive detection (no drift).
 
     Returns:
-        Corrected [N, H, W] tensor.
+        Corrected [N, H, W] tensor (unclamped — caller handles clamping).
     """
     N = ch_data.shape[0]
     if N < 3:
@@ -145,47 +149,79 @@ def _remove_steps(
 
     flat = ch_data.reshape(N, -1)
 
-    # Compute per-frame means (using content mask if provided)
+    # Compute per-frame stats (using content mask if provided)
     if content_mask is not None:
         mask_flat = content_mask.reshape(-1)
         if mask_flat.any():
-            frame_means = flat[:, mask_flat].mean(dim=1)
+            stats_data = flat[:, mask_flat]
         else:
-            frame_means = flat.mean(dim=1)
+            stats_data = flat
     else:
-        frame_means = flat.mean(dim=1)
+        stats_data = flat
+
+    frame_means = stats_data.mean(dim=1)  # [N]
+    frame_stds = stats_data.std(dim=1)    # [N]
 
     # Frame-to-frame diffs
-    diffs = frame_means[1:] - frame_means[:-1]
+    mean_diffs = frame_means[1:] - frame_means[:-1]
+    std_diffs = frame_stds[1:] - frame_stds[:-1]
 
     # Threshold: outlier diffs relative to the typical noise.
-    # Use a brightness-relative floor so detection works even when frames
-    # are nearly identical (e.g., static scene with only step changes).
-    median_abs_diff = diffs.abs().median()
+    median_abs_diff = mean_diffs.abs().median()
     floor = frame_means.mean().item() * 0.005  # 0.5% of mean brightness
     threshold = max(median_abs_diff.item() * threshold_mult, floor)
 
     if threshold < 1e-6:
         return ch_data.clone()
 
-    # Accumulate step corrections (vectorized)
-    step_corrections = torch.where(diffs.abs() > threshold, -diffs, torch.zeros_like(diffs))
-    cumulative = torch.zeros(N, device=ch_data.device)
-    cumulative[1:] = step_corrections.cumsum(dim=0)
+    # strength > 1.0 → lower threshold (catch smaller steps)
+    # correction always at 100% to prevent progressive drift
+    detection_boost = max(strength, 1.0)
+    effective_threshold = threshold / detection_boost
+    correction_blend = min(strength, 1.0)
 
-    # No steps detected
-    if cumulative.abs().max() < 1e-6:
+    # Detect steps
+    is_step = mean_diffs.abs() > effective_threshold
+
+    if not is_step.any():
         return ch_data.clone()
 
-    # Blend with strength
-    cumulative = cumulative * strength
+    # Accumulate step corrections for both mean and std (vectorized)
+    mean_corrections = torch.where(is_step, -mean_diffs, torch.zeros_like(mean_diffs))
+    std_corrections = torch.where(is_step, -std_diffs, torch.zeros_like(std_diffs))
 
-    # Apply as gain correction (preserves black levels)
-    target_means = frame_means + cumulative
+    cum_mean = torch.zeros(N, device=ch_data.device)
+    cum_std = torch.zeros(N, device=ch_data.device)
+    cum_mean[1:] = mean_corrections.cumsum(dim=0)
+    cum_std[1:] = std_corrections.cumsum(dim=0)
+
+    # Blend for strength < 1.0 (partial correction)
+    cum_mean = cum_mean * correction_blend
+    cum_std = cum_std * correction_blend
+
+    # Target stats (anchored to first stable segment)
+    target_means = frame_means + cum_mean
+    target_stds = (frame_stds + cum_std).clamp(min=1e-4)
     safe_means = frame_means.clamp(min=1e-2)
-    gains = (target_means / safe_means).clamp(0.25, 4.0).view(-1, 1, 1)
+    safe_stds = frame_stds.clamp(min=1e-4)
 
-    return ch_data * gains
+    # Step 1: Gain correction for mean (preserves black = 0)
+    gains = (target_means / safe_means).clamp(0.25, 4.0)
+
+    # Step 2: Contrast/gamma correction via std matching
+    # After gain, effective std = frame_std * gain
+    effective_stds = (safe_stds * gains).clamp(min=1e-4)
+    contrast_ratios = (target_stds / effective_stds).clamp(0.5, 2.0)
+
+    # Apply: gain first, then contrast around the new mean
+    gains_3d = gains.view(-1, 1, 1)
+    target_means_3d = target_means.view(-1, 1, 1)
+    contrast_3d = contrast_ratios.view(-1, 1, 1)
+
+    gained = ch_data * gains_3d
+    corrected = target_means_3d + (gained - target_means_3d) * contrast_3d
+
+    return corrected
 
 
 # ---------------------------------------------------------------------------
