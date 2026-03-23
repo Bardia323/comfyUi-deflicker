@@ -56,6 +56,14 @@ The node outputs two images:
 | `eq_blend_radius` | 5 | Number of frames to blend around each detected boundary. |
 | `eq_sensitivity` | 1.5 | Boundary detection sensitivity. Lower = more sensitive. Range 1.0–6.0. |
 
+## Modes
+
+The node has three operating modes:
+
+- **step_removal** (default) — Detects and removes sharp brightness/gamma jumps at chunk boundaries. Best for latent space shift artifacts in multi-chunk AI video (WAN, VACE, FramePack). Preserves natural trends, only removes discrete steps.
+- **temporal_smoothing** — Gaussian window-based smoothing of per-frame brightness. Best for random per-frame flicker noise. Use `smooth_window` to control how aggressively it smooths.
+- **both** — Runs step removal first, then temporal smoothing on the result. Use when you have both chunk boundary steps AND random per-frame flicker.
+
 ## How it works
 
 The node runs up to four correction phases depending on mode:
