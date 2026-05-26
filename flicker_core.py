@@ -580,10 +580,19 @@ def _pixel_temporal_smooth(
         
         # Copy ONLY this band to the GPU
         band_device = band.to(device)
-        flat = band_device.permute(1, 2, 3, 0).reshape(-1, 1, B)        # [h*W*C, 1, B]
-        padded = F.pad(flat, (half, half), mode="reflect")       # reflect = no edge bias
-        smoothed = F.conv1d(padded, kernel)                      # [h*W*C, 1, B]
-        smoothed = smoothed.reshape(y1 - y0, W, C, B).permute(3, 0, 1, 2)
+        flat = band_device.permute(1, 2, 3, 0).reshape(-1, 1, B)        # [N, 1, B]
+        N = flat.shape[0]
+        
+        # Convolve in chunks of safe batch size to avoid CUDA grid/block limits (cudaErrorInvalidConfiguration)
+        smoothed_flat = torch.empty_like(flat)
+        safe_batch = 131072
+        for offset in range(0, N, safe_batch):
+            chunk = flat[offset:offset+safe_batch]
+            padded = F.pad(chunk, (half, half), mode="reflect")
+            smoothed_flat[offset:offset+safe_batch] = F.conv1d(padded, kernel)
+            del padded, chunk
+        
+        smoothed = smoothed_flat.reshape(y1 - y0, W, C, B).permute(3, 0, 1, 2)
         
         # Blend: original * (1-strength) + smoothed * strength
         blended = band_device * (1.0 - blend_strength) + smoothed * blend_strength
@@ -592,7 +601,7 @@ def _pixel_temporal_smooth(
         result[:, y0:y1] = blended.to(result.device)
         
         # Free memory immediately
-        del band_device, flat, padded, smoothed, blended
+        del band_device, flat, smoothed_flat, smoothed, blended
         _safe_empty_cache()
 
     return result
