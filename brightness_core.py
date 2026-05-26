@@ -3,9 +3,9 @@ import torch.nn.functional as F
 from typing import List
 
 try:
-    from .flicker_core import _compute_content_mask
+    from .flicker_core import _compute_content_mask, _safe_empty_cache
 except ImportError:
-    from flicker_core import _compute_content_mask
+    from flicker_core import _compute_content_mask, _safe_empty_cache
 
 
 # ---------------------------------------------------------------------------
@@ -54,68 +54,77 @@ _KAPPA = (29.0 / 6.0) ** 2 / 3  # 7.787037
 
 def srgb_to_lab(images: torch.Tensor) -> torch.Tensor:
     """Convert sRGB [0,1] images to LAB. Input/output: [B,H,W,3]."""
+    B, H, W, C = images.shape
     device = images.device
+    lab = torch.empty(B, H, W, 3, dtype=images.dtype, device=device)
+    
+    chunk_size = 32
     rgb_to_xyz = _RGB_TO_XYZ.to(device)
     d65 = _D65.to(device)
 
-    # sRGB -> linear RGB
-    linear = _srgb_to_linear(images)
-
-    # linear RGB -> XYZ via matrix multiply
-    xyz = torch.einsum("...c,cd->...d", linear, rgb_to_xyz.T)
-
-    # Normalize by D65 whitepoint
-    xyz_norm = xyz / d65
-
-    # XYZ -> LAB f(t) function
-    f = torch.where(
-        xyz_norm > _EPSILON,
-        xyz_norm.clamp(min=1e-10) ** (1.0 / 3.0),
-        _KAPPA * xyz_norm + 16.0 / 116.0,
-    )
-
-    L = 116.0 * f[..., 1] - 16.0
-    a = 500.0 * (f[..., 0] - f[..., 1])
-    b = 200.0 * (f[..., 1] - f[..., 2])
-
-    return torch.stack([L, a, b], dim=-1)
+    for i in range(0, B, chunk_size):
+        chunk = images[i:i+chunk_size]
+        # sRGB -> linear RGB
+        linear = _srgb_to_linear(chunk)
+        # linear RGB -> XYZ via matrix multiply
+        xyz = torch.einsum("...c,cd->...d", linear, rgb_to_xyz.T)
+        # Normalize by D65 whitepoint
+        xyz_norm = xyz / d65
+        # XYZ -> LAB f(t) function
+        f = torch.where(
+            xyz_norm > _EPSILON,
+            xyz_norm.clamp(min=1e-10) ** (1.0 / 3.0),
+            _KAPPA * xyz_norm + 16.0 / 116.0,
+        )
+        L = 116.0 * f[..., 1] - 16.0
+        a = 500.0 * (f[..., 0] - f[..., 1])
+        b = 200.0 * (f[..., 1] - f[..., 2])
+        
+        lab[i:i+chunk_size] = torch.stack([L, a, b], dim=-1)
+        
+        del chunk, linear, xyz, xyz_norm, f, L, a, b
+        _safe_empty_cache()
+        
+    return lab
 
 
 def lab_to_srgb(lab: torch.Tensor) -> torch.Tensor:
     """Convert LAB to sRGB [0,1]. Input/output: [B,H,W,3]. Output clamped to [0,1]."""
+    B, H, W, C = lab.shape
     device = lab.device
+    srgb = torch.empty(B, H, W, 3, dtype=lab.dtype, device=device)
+    
+    chunk_size = 32
     xyz_to_rgb = _XYZ_TO_RGB.to(device)
     d65 = _D65.to(device)
 
-    L = lab[..., 0]
-    a = lab[..., 1]
-    b = lab[..., 2]
-
-    # LAB -> f values
-    fy = (L + 16.0) / 116.0
-    fx = a / 500.0 + fy
-    fz = fy - b / 200.0
-
-    # Inverse f(t): f -> t
-    def inv_f(f_val):
-        return torch.where(
-            f_val > 6.0 / 29.0,
-            f_val ** 3,
-            (f_val - 16.0 / 116.0) / _KAPPA,
-        )
-
-    xyz = torch.stack([inv_f(fx), inv_f(fy), inv_f(fz)], dim=-1)
-
-    # Denormalize by D65
-    xyz = xyz * d65
-
-    # XYZ -> linear RGB
-    linear = torch.einsum("...c,cd->...d", xyz, xyz_to_rgb.T)
-
-    # linear RGB -> sRGB
-    srgb = _linear_to_srgb(linear)
-
-    return srgb.clamp(0.0, 1.0)
+    for i in range(0, B, chunk_size):
+        chunk = lab[i:i+chunk_size]
+        L = chunk[..., 0]
+        a = chunk[..., 1]
+        b = chunk[..., 2]
+        fy = (L + 16.0) / 116.0
+        fx = a / 500.0 + fy
+        fz = fy - b / 200.0
+        
+        def inv_f(f_val):
+            return torch.where(
+                f_val > 6.0 / 29.0,
+                f_val ** 3,
+                (f_val - 16.0 / 116.0) / _KAPPA,
+            )
+            
+        xyz = torch.stack([inv_f(fx), inv_f(fy), inv_f(fz)], dim=-1)
+        xyz = xyz * d65
+        linear = torch.einsum("...c,cd->...d", xyz, xyz_to_rgb.T)
+        srgb_chunk = _linear_to_srgb(linear)
+        
+        srgb[i:i+chunk_size] = srgb_chunk.clamp(0.0, 1.0)
+        
+        del chunk, L, a, b, fy, fx, fz, xyz, linear, srgb_chunk
+        _safe_empty_cache()
+        
+    return srgb
 
 
 # ---------------------------------------------------------------------------
@@ -287,19 +296,23 @@ def _generate_heatmap(correction_map: torch.Tensor) -> torch.Tensor:
     device = correction_map.device
     B, H, W = correction_map.shape
 
-    max_abs = correction_map.abs().max()
+    max_abs = correction_map.abs().max().item()
+    heatmap = torch.zeros(B, H, W, 3, dtype=correction_map.dtype, device=device)
     if max_abs < 1e-6:
-        return torch.zeros(B, H, W, 3, device=device)
+        return heatmap
 
-    # Normalize and boost contrast with sqrt (gamma=0.5) so subtle
-    # corrections are more visible in the heatmap
-    normalized = correction_map / max_abs  # range [-1, 1]
-    boosted = normalized.abs().sqrt() * normalized.sign()
-
-    heatmap = torch.zeros(B, H, W, 3, device=device)
-    # Positive (brightening) -> red
-    heatmap[..., 0] = boosted.clamp(min=0)   # R = brightening
-    heatmap[..., 2] = (-boosted).clamp(min=0)  # B = darkening
+    # Normalize, boost contrast, and populate incrementally to keep RAM flat
+    chunk_size = 32
+    for i in range(0, B, chunk_size):
+        chunk = correction_map[i:i+chunk_size]
+        normalized = chunk / max_abs  # range [-1, 1]
+        boosted = normalized.abs().sqrt() * normalized.sign()
+        
+        heatmap[i:i+chunk_size, ..., 0] = boosted.clamp(min=0)   # R = brightening
+        heatmap[i:i+chunk_size, ..., 2] = (-boosted).clamp(min=0)  # B = darkening
+        
+        del chunk, normalized, boosted
+        _safe_empty_cache()
 
     return heatmap
 
@@ -538,8 +551,7 @@ def auto_brightness_equalize(
                 current_group = [b]
         groups.append(current_group)
 
-        phase2_lab = corrected_lab.clone()
-
+        # We process in-place directly on corrected_lab to avoid allocating an extra 25 GB clone.
         for group in groups:
             zone_start = group[0]     # first boundary in group
             zone_end = group[-1]      # last boundary in group
@@ -571,7 +583,7 @@ def auto_brightness_equalize(
                         corrected_lab[stable_after_idx], t, strength,
                         grid_size, ch_ranges,
                     )
-                    phase2_lab[i] = corrected_frame
+                    corrected_lab[i] = corrected_frame
                     correction_map[i] += L_corr
                 else:
                     for ch in range(3):
@@ -585,12 +597,13 @@ def auto_brightness_equalize(
                         # Apply with strength
                         blended_target = _blend_cdfs(frame_cdf, target_cdf, strength)
                         matched = _histogram_match(frame_ch, frame_cdf, blended_target, vmin, vmax)
-                        phase2_lab[i, ..., ch] = matched.clamp(vmin, vmax)
+                        corrected_lab[i, ..., ch] = matched.clamp(vmin, vmax)
 
                         if ch == 0:
                             correction_map[i] += matched - frame_ch
-
-        corrected_lab = phase2_lab
+                
+                # Keep RAM flat during frame-by-frame processing
+                _safe_empty_cache()
 
     # Convert back to sRGB
     corrected_images = lab_to_srgb(corrected_lab)
