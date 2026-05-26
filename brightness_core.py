@@ -490,10 +490,14 @@ def auto_brightness_equalize(
         all_means = []  # [3, num_frames]
         for ch in range(3):
             ch_data = lab[..., ch]  # [num_frames, H, W]
+            frame_means = torch.empty(num_frames, dtype=lab.dtype, device=lab.device)
             if lab_mask is not None:
-                frame_means = ch_data[:, lab_mask].mean(dim=1)
+                mask_flat = lab_mask.reshape(-1)
+                for i in range(num_frames):
+                    frame_means[i] = ch_data[i].reshape(-1)[mask_flat].mean()
             else:
-                frame_means = ch_data.reshape(num_frames, -1).mean(dim=1)
+                for i in range(num_frames):
+                    frame_means[i] = ch_data[i].mean()
             all_means.append(frame_means)
 
         # Compute temporally smoothed target means

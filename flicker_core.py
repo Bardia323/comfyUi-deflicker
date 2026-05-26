@@ -37,7 +37,14 @@ def _compute_content_mask(images: torch.Tensor, threshold: float = 0.02) -> torc
         [H, W] boolean mask. True = content pixel.
     """
     # Mean brightness per pixel across all frames and channels
-    temporal_mean = images.mean(dim=(0, -1))  # [H, W]
+    # Compute incrementally in chunks to avoid memory spikes on massive tensors
+    B, H, W, C = images.shape
+    chunk_size = 32
+    running_sum = torch.zeros(H, W, device=images.device, dtype=torch.float64)
+    for i in range(0, B, chunk_size):
+        chunk = images[i:i+chunk_size]
+        running_sum += chunk.mean(dim=-1).sum(dim=0)
+    temporal_mean = (running_sum / B).to(images.dtype)
     mask = temporal_mean >= threshold
 
     # Safety: if mask excludes >95% of pixels, it's probably a very dark
@@ -147,20 +154,23 @@ def _remove_steps(
     if N < 3:
         return ch_data.clone()
 
-    flat = ch_data.reshape(N, -1)
-
-    # Compute per-frame stats (using content mask if provided)
+    # Compute per-frame stats incrementally to avoid allocating massive stats_data copies
+    frame_means = torch.empty(N, dtype=ch_data.dtype, device=ch_data.device)
+    frame_stds = torch.empty(N, dtype=ch_data.dtype, device=ch_data.device)
     if content_mask is not None:
         mask_flat = content_mask.reshape(-1)
-        if mask_flat.any():
-            stats_data = flat[:, mask_flat]
-        else:
-            stats_data = flat
+        has_mask = mask_flat.any()
     else:
-        stats_data = flat
+        has_mask = False
 
-    frame_means = stats_data.mean(dim=1)  # [N]
-    frame_stds = stats_data.std(dim=1)    # [N]
+    for i in range(N):
+        frame = ch_data[i]
+        if has_mask:
+            frame_flat = frame.reshape(-1)[mask_flat]
+        else:
+            frame_flat = frame.reshape(-1)
+        frame_means[i] = frame_flat.mean()
+        frame_stds[i] = frame_flat.std()
 
     # Frame-to-frame diffs
     mean_diffs = frame_means[1:] - frame_means[:-1]
@@ -240,19 +250,29 @@ def _masked_frame_means(
     Returns:
         [B] tensor of per-frame means.
     """
-    if content_mask is None:
-        if images.dim() == 4:
-            return images.mean(dim=(1, 2, 3))
-        return images.mean(dim=(1, 2))
+    B = images.shape[0]
+    means = torch.empty(B, dtype=images.dtype, device=images.device)
 
+    if content_mask is None:
+        chunk_size = 32
+        for i in range(0, B, chunk_size):
+            chunk = images[i:i+chunk_size]
+            if images.dim() == 4:
+                means[i:i+chunk_size] = chunk.mean(dim=(1, 2, 3))
+            else:
+                means[i:i+chunk_size] = chunk.mean(dim=(1, 2))
+        return means
+
+    # Compute frame-by-frame to avoid allocating massive intermediate flat copies
     if images.dim() == 4:
-        # [B, H, W, C] -> mask [H, W] -> expand to [H, W, C]
-        mask_expanded = content_mask.unsqueeze(-1).expand_as(images[0])
-        flat = images[:, mask_expanded].reshape(images.shape[0], -1)
+        for i in range(B):
+            frame = images[i]
+            means[i] = frame[content_mask].mean()
     else:
-        # [B, H, W]
-        flat = images[:, content_mask]
-    return flat.mean(dim=1)
+        for i in range(B):
+            frame = images[i]
+            means[i] = frame[content_mask].mean()
+    return means
 
 
 def _detect_trend(frame_means: torch.Tensor) -> bool:
@@ -315,14 +335,20 @@ def _correct_channel(
         Corrected [N, H, W] (unclamped — caller handles clamping).
     """
     num_frames = ch_data.shape[0]
-    flat = ch_data.reshape(num_frames, -1)
-
-    # Use only content pixels for statistics, but correct all pixels
+    # Compute per-frame means incrementally to avoid allocating massive intermediate copies
+    frame_means = torch.empty(num_frames, dtype=ch_data.dtype, device=ch_data.device)
     if content_mask is not None:
         mask_flat = content_mask.reshape(-1)
-        frame_means = flat[:, mask_flat].mean(dim=1)  # [N]
+        has_mask = mask_flat.any()
     else:
-        frame_means = flat.mean(dim=1)  # [N]
+        has_mask = False
+
+    for i in range(num_frames):
+        frame = ch_data[i]
+        if has_mask:
+            frame_means[i] = frame.reshape(-1)[mask_flat].mean()
+        else:
+            frame_means[i] = frame.mean()
     global_mean = frame_means.mean()
 
     if has_trend:
