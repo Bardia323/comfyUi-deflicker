@@ -505,13 +505,19 @@ def _pixel_temporal_smooth(
     if window_size < 3:
         return images
 
+    try:
+        import comfy.model_management
+        device = comfy.model_management.get_torch_device()
+    except ImportError:
+        device = images.device
+
     # Gaussian weights for the temporal window
     sigma = window_size / 4.0
     half = window_size // 2
-    t = torch.arange(-half, half + 1, dtype=torch.float32, device=images.device)
+    t = torch.arange(-half, half + 1, dtype=torch.float32, device=device)
     weights = torch.exp(-0.5 * (t / max(sigma, 0.5)) ** 2)
     weights = weights / weights.sum()  # [K]
-    kernel = weights.flip(0).view(1, 1, -1)  # [1, 1, K]
+    kernel = weights.flip(0).view(1, 1, -1).to(device)  # [1, 1, K]
 
     B, H, W, C = images.shape
     result = images if inplace else torch.empty_like(images)
@@ -530,12 +536,22 @@ def _pixel_temporal_smooth(
         # band is a view; permute+reshape forces a contiguous copy, so the
         # conv reads a snapshot and writing back to images[:, y0:y1] is safe.
         band = images[:, y0:y1]                                  # [B, h, W, C]
-        flat = band.permute(1, 2, 3, 0).reshape(-1, 1, B)        # [h*W*C, 1, B]
+        
+        # Copy ONLY this band to the GPU
+        band_device = band.to(device)
+        flat = band_device.permute(1, 2, 3, 0).reshape(-1, 1, B)        # [h*W*C, 1, B]
         padded = F.pad(flat, (half, half), mode="reflect")       # reflect = no edge bias
         smoothed = F.conv1d(padded, kernel)                      # [h*W*C, 1, B]
         smoothed = smoothed.reshape(y1 - y0, W, C, B).permute(3, 0, 1, 2)
+        
         # Blend: original * (1-strength) + smoothed * strength
-        result[:, y0:y1] = band * (1.0 - blend_strength) + smoothed * blend_strength
+        blended = band_device * (1.0 - blend_strength) + smoothed * blend_strength
+        
+        # Copy back to result on its original device
+        result[:, y0:y1] = blended.to(result.device)
+        
+        # Free memory immediately
+        del band_device, flat, padded, smoothed, blended
 
     return result
 

@@ -79,13 +79,6 @@ class DeflickerFrames:
         if output_heatmap is None:
             output_heatmap = True
 
-        import comfy.model_management
-        device = comfy.model_management.get_torch_device()
-        original_device = images.device
-
-        # Move images to ComfyUI's preferred execution device (e.g. cuda or mps)
-        images = images.to(device)
-
         # Compute content mask once from original images (excludes black borders)
         content_mask = _compute_content_mask(images)
 
@@ -132,4 +125,4 @@ class DeflickerFrames:
                 grid_size=smooth_grid, content_mask=content_mask,
             )
 
-        return (corrected.to(original_device), heatmap.to(original_device))
+        return (corrected, heatmap)
