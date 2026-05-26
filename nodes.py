@@ -58,11 +58,13 @@ class DeflickerFrames:
                     "default": 1.5, "min": 1.0, "max": 6.0, "step": 0.5,
                     "tooltip": "Equalize: detection sensitivity. Lower = more sensitive.",
                 }),
+            },
+            "optional": {
                 "output_heatmap": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Generate the debug_heatmap output. Turn OFF on long clips / low RAM — it saves a full-size image buffer. When off, debug_heatmap is a 1x1 placeholder.",
                 }),
-            },
+            }
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE")
@@ -74,6 +76,8 @@ class DeflickerFrames:
                   smooth_window, smooth_drift, smooth_median, smooth_pixel,
                   smooth_grid, eq_enable, eq_blend_radius, eq_sensitivity,
                   output_heatmap=True):
+        if output_heatmap is None:
+            output_heatmap = True
         # Compute content mask once from original images (excludes black borders)
         content_mask = _compute_content_mask(images)
 
