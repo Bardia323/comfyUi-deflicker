@@ -593,6 +593,7 @@ def _pixel_temporal_smooth(
         
         # Free memory immediately
         del band_device, flat, padded, smoothed, blended
+        _safe_empty_cache()
 
     return result
 
@@ -771,6 +772,7 @@ def _generate_correction_heatmap(
         diff_chunk = c_chunk.mean(dim=-1) - o_chunk.mean(dim=-1)
         max_abs = max(max_abs, diff_chunk.abs().max().item())
         del diff_chunk
+        _safe_empty_cache()
 
     heatmap = torch.zeros(B, H, W, 3, dtype=corrected.dtype, device=device)
     if max_abs < 1e-6:
@@ -787,5 +789,6 @@ def _generate_correction_heatmap(
         heatmap[i:i+chunk_size, ..., 2] = (-normalized).clamp(min=0)
         
         del diff_chunk, normalized
+        _safe_empty_cache()
 
     return heatmap
