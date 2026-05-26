@@ -455,28 +455,45 @@ def _correct_channel_grid(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# Target working-set size for one band of the per-pixel temporal pass. The
+# whole video is never reshaped at once — we slice the frame into row-bands and
+# run the conv over each band, so peak RAM stays near this budget regardless of
+# clip length. Bump this if you have RAM to spare and want fewer, larger bands.
+_PIXEL_BAND_BUDGET_BYTES = 512 * 1024 * 1024
+
+
 def _pixel_temporal_smooth(
     images: torch.Tensor,
     window_size: int,
     blend_strength: float,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """Per-pixel temporal smoothing (inspired by SuperBeasts PixelDeflicker).
 
-    For each pixel, averages its value across neighboring frames within a
-    sliding window. This removes spatially-varying flicker that frame-mean
-    correction cannot address. The result is blended with the input using
-    blend_strength to preserve detail.
+    For each pixel, runs a Gaussian-weighted average across neighbouring frames
+    within a sliding window — a genuine 1D convolution over the time axis (via
+    ``F.conv1d``), not an approximation. This removes spatially-varying flicker
+    that frame-mean correction cannot address. The result is blended with the
+    input using ``blend_strength`` to preserve detail.
 
-    Uses Gaussian-weighted averaging (not box filter) to preserve temporal
-    sharpness while removing high-frequency pixel-level noise.
+    Memory: the whole video is never materialised at once. The frame is sliced
+    into horizontal row-bands and the convolution runs band-by-band, so peak
+    RAM stays near ``_PIXEL_BAND_BUDGET_BYTES`` no matter how many frames are
+    passed in. Each pixel's temporal convolution is independent of every other
+    pixel, so banding is exact — bit-for-bit identical to convolving the whole
+    tensor in one shot.
 
     Args:
         images: [B, H, W, C] tensor.
         window_size: temporal window for averaging.
         blend_strength: 0=no pixel smoothing, 1=full replacement.
+        inplace: if True, write the blended result back into ``images`` instead
+            of allocating a new output buffer. Safe because each band is fully
+            read (and copied) before its slice is overwritten. Only pass True
+            when the caller owns ``images``.
 
     Returns:
-        Blended [B, H, W, C] tensor.
+        Blended [B, H, W, C] tensor (``images`` itself when ``inplace``).
     """
     if blend_strength <= 0 or window_size <= 1:
         return images
@@ -494,20 +511,32 @@ def _pixel_temporal_smooth(
     t = torch.arange(-half, half + 1, dtype=torch.float32, device=images.device)
     weights = torch.exp(-0.5 * (t / max(sigma, 0.5)) ** 2)
     weights = weights / weights.sum()  # [K]
-
-    # Weighted temporal average per pixel using conv1d
-    # Reshape: [B, H, W, C] -> [H*W*C, 1, B] for conv1d over time axis
-    B, H, W, C = images.shape
-    flat = images.permute(1, 2, 3, 0).reshape(-1, 1, B)  # [H*W*C, 1, B]
-
     kernel = weights.flip(0).view(1, 1, -1)  # [1, 1, K]
-    padded = F.pad(flat, (half, half), mode="reflect")
-    smoothed = F.conv1d(padded, kernel)  # [H*W*C, 1, B]
 
-    smoothed = smoothed.reshape(H, W, C, B).permute(3, 0, 1, 2)  # [B, H, W, C]
+    B, H, W, C = images.shape
+    result = images if inplace else torch.empty_like(images)
 
-    # Blend: original * (1-strength) + smoothed * strength
-    result = images * (1.0 - blend_strength) + smoothed * blend_strength
+    # Band height chosen so one band's conv intermediates stay near the budget.
+    # F.conv1d unfolds the kernel internally, so its transient workspace scales
+    # with the window size (~K), not just a fixed number of copies. Size the
+    # band by (window_size + a few copies) so a wide window doesn't blow past
+    # the budget. Always at least one row, so even huge frames make progress.
+    bytes_per_row = W * C * B * images.element_size()
+    per_row_workspace = bytes_per_row * (window_size + 4)
+    rows = max(1, int(_PIXEL_BAND_BUDGET_BYTES / max(per_row_workspace, 1)))
+
+    for y0 in range(0, H, rows):
+        y1 = min(H, y0 + rows)
+        # band is a view; permute+reshape forces a contiguous copy, so the
+        # conv reads a snapshot and writing back to images[:, y0:y1] is safe.
+        band = images[:, y0:y1]                                  # [B, h, W, C]
+        flat = band.permute(1, 2, 3, 0).reshape(-1, 1, B)        # [h*W*C, 1, B]
+        padded = F.pad(flat, (half, half), mode="reflect")       # reflect = no edge bias
+        smoothed = F.conv1d(padded, kernel)                      # [h*W*C, 1, B]
+        smoothed = smoothed.reshape(y1 - y0, W, C, B).permute(3, 0, 1, 2)
+        # Blend: original * (1-strength) + smoothed * strength
+        result[:, y0:y1] = band * (1.0 - blend_strength) + smoothed * blend_strength
+
     return result
 
 
@@ -523,6 +552,7 @@ def deflicker_frames(
     drift_mode: str = "auto",
     content_mask: torch.Tensor | None = None,
     mode: str = "temporal_smoothing",
+    gen_heatmap: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remove temporal brightness/color flicker from a frame sequence.
 
@@ -552,15 +582,21 @@ def deflicker_frames(
         mode: "temporal_smoothing" = classic window-based correction,
               "step_removal" = instant step discontinuity correction,
               "both" = step removal then temporal smoothing.
+        gen_heatmap: If True, build the debug heatmap (an extra full-size
+            [B, H, W, 3] buffer). Set False on long sequences / tight RAM to
+            skip that allocation; a tiny placeholder is returned instead.
 
     Returns:
-        (corrected_images, debug_heatmap) — both [B, H, W, 3].
+        (corrected_images, debug_heatmap). corrected is [B, H, W, 3]; the
+        heatmap is [B, H, W, 3] when gen_heatmap is True, else a [1, 1, 1, 3]
+        placeholder.
     """
     num_frames, H, W, C = images.shape
     device = images.device
 
     if num_frames < 2 or strength <= 0:
-        return images, torch.zeros(num_frames, H, W, 3, device=device)
+        hm_shape = (num_frames, H, W, 3) if gen_heatmap else (1, 1, 1, 3)
+        return images, torch.zeros(*hm_shape, device=device)
 
     smooth_fn = temporal_median_smooth if use_median else temporal_smooth
 
@@ -572,6 +608,20 @@ def deflicker_frames(
     do_temporal = mode in ("temporal_smoothing", "both")
 
     corrected = images
+    # Track whether `corrected` is a buffer we own (a fresh allocation) versus
+    # still the caller's input tensor. Once we own it we mutate in place, which
+    # avoids holding two full-size [N,H,W,3] copies at the peak of each phase —
+    # the difference between fitting in RAM and crashing on long clips.
+    owns_buffer = False
+
+    def _apply_gain(buf, gain_map, owns):
+        """Multiply the full frame buffer by a broadcast gain map, in place
+        when we own the buffer. Returns (new_buffer, owns=True)."""
+        gain_map = gain_map.clamp(0.25, 4.0)
+        if owns:
+            buf.mul_(gain_map).clamp_(0.0, 1.0)
+            return buf, True
+        return (buf * gain_map).clamp(0.0, 1.0), True
 
     # --- Phase 0: Step removal (latent space shift correction) ---
     if do_steps:
@@ -581,10 +631,12 @@ def deflicker_frames(
                 brightness, content_mask, strength=strength,
             )
             gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
-            gain_map = gain_map.clamp(0.25, 4.0)
-            corrected = (corrected * gain_map).clamp(0.0, 1.0)
+            del brightness, corrected_brightness
+            corrected, owns_buffer = _apply_gain(corrected, gain_map, owns_buffer)
+            del gain_map
         else:
             corrected = corrected.clone()
+            owns_buffer = True
             for ch in range(3):
                 corrected[..., ch] = _remove_steps(
                     corrected[..., ch], content_mask, strength=strength,
@@ -615,8 +667,9 @@ def deflicker_frames(
                 brightness, window_size, strength, smooth_fn, has_trend,
             )
             gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
-            gain_map = gain_map.clamp(0.25, 4.0)
-            corrected = (corrected * gain_map).clamp(0.0, 1.0)
+            del brightness, corrected_brightness
+            corrected, owns_buffer = _apply_gain(corrected, gain_map, owns_buffer)
+            del gain_map
         else:
             tmp = corrected.clone()
             for ch in range(3):
@@ -624,15 +677,22 @@ def deflicker_frames(
                     corrected[..., ch], window_size, strength, smooth_fn, has_trend,
                 )
             corrected = tmp.clamp(0.0, 1.0)
+            owns_buffer = True
 
     # --- Phase 2: Per-pixel temporal smoothing (optional) ---
     if pixel_smoothing > 0 and do_temporal:
+        # By Phase 2 we always own `corrected` (Phase 1 produced it), so the
+        # banded pass can write back in place — no second full-video buffer.
         corrected = _pixel_temporal_smooth(
             corrected, window_size, pixel_smoothing * strength,
+            inplace=owns_buffer,
         )
-        corrected = corrected.clamp(0.0, 1.0)
+        corrected.clamp_(0.0, 1.0)
 
-    heatmap = _generate_correction_heatmap(corrected, images)
+    if gen_heatmap:
+        heatmap = _generate_correction_heatmap(corrected, images)
+    else:
+        heatmap = torch.zeros(1, 1, 1, 3, device=device)
     return corrected, heatmap
 
 

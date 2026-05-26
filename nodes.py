@@ -58,6 +58,10 @@ class DeflickerFrames:
                     "default": 1.5, "min": 1.0, "max": 6.0, "step": 0.5,
                     "tooltip": "Equalize: detection sensitivity. Lower = more sensitive.",
                 }),
+                "output_heatmap": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Generate the debug_heatmap output. Turn OFF on long clips / low RAM — it saves a full-size image buffer. When off, debug_heatmap is a 1x1 placeholder.",
+                }),
             },
         }
 
@@ -68,19 +72,21 @@ class DeflickerFrames:
 
     def deflicker(self, images, mode, channels, step_strength, smooth_strength,
                   smooth_window, smooth_drift, smooth_median, smooth_pixel,
-                  smooth_grid, eq_enable, eq_blend_radius, eq_sensitivity):
+                  smooth_grid, eq_enable, eq_blend_radius, eq_sensitivity,
+                  output_heatmap=True):
         # Compute content mask once from original images (excludes black borders)
         content_mask = _compute_content_mask(images)
 
         if mode == "both":
-            # Run step removal and temporal smoothing with separate strengths
+            # Run step removal and temporal smoothing with separate strengths.
+            # The intermediate pass never needs a heatmap.
             corrected, _ = deflicker_frames(
                 images=images, window_size=smooth_window,
                 strength=step_strength,
                 channels=channels, use_median=smooth_median,
                 pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
                 drift_mode=smooth_drift, content_mask=content_mask,
-                mode="step_removal",
+                mode="step_removal", gen_heatmap=False,
             )
             corrected, _ = deflicker_frames(
                 images=corrected, window_size=smooth_window,
@@ -88,10 +94,13 @@ class DeflickerFrames:
                 channels=channels, use_median=smooth_median,
                 pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
                 drift_mode=smooth_drift, content_mask=content_mask,
-                mode="temporal_smoothing",
+                mode="temporal_smoothing", gen_heatmap=False,
             )
             # Heatmap shows total correction vs original
-            heatmap = _generate_correction_heatmap(corrected, images)
+            if output_heatmap:
+                heatmap = _generate_correction_heatmap(corrected, images)
+            else:
+                heatmap = torch.zeros(1, 1, 1, 3, device=images.device)
         else:
             strength = step_strength if mode == "step_removal" else smooth_strength
             corrected, heatmap = deflicker_frames(
@@ -100,7 +109,7 @@ class DeflickerFrames:
                 channels=channels, use_median=smooth_median,
                 pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
                 drift_mode=smooth_drift, content_mask=content_mask,
-                mode=mode,
+                mode=mode, gen_heatmap=output_heatmap,
             )
 
         # Equalize (boundary smoothing)

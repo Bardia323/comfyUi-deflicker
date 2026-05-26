@@ -55,6 +55,8 @@ The node outputs two images:
 | `eq_enable` | off | Auto brightness equalize: detect and smooth chunk boundary jumps. |
 | `eq_blend_radius` | 5 | Number of frames to blend around each detected boundary. |
 | `eq_sensitivity` | 1.5 | Boundary detection sensitivity. Lower = more sensitive. Range 1.0–6.0. |
+| | | **Output** |
+| `output_heatmap` | on | Generate the `debug_heatmap` output. Turn **off** on long clips or low-RAM machines — it saves a full-size image buffer. When off, `debug_heatmap` is a 1×1 placeholder. |
 
 ## Modes
 
@@ -97,6 +99,7 @@ Automatically detects black borders from stabilized/cropped footage (letterbox, 
 - **Set `smooth_drift` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
 - **Turn on `smooth_pixel`** (0.3–0.5) if different parts of the frame flicker differently
 - **Increase `smooth_grid`** (e.g. 4–6) only if the flicker is not uniform across the frame (e.g. one side flickers more than the other). The default global correction works well for most cases.
+- **Long videos / ComfyUI crashes from RAM** — turn **off** `output_heatmap`. Smoothing (including `smooth_pixel`) now runs in memory-bounded bands rather than reshaping the whole clip at once, so peak RAM no longer grows with frame count. The debug heatmap is the one remaining full-size extra buffer; disabling it drops peak RAM roughly to one input + one output copy.
 - **Lower `eq_sensitivity`** (e.g. 1.0) to catch subtle chunk boundaries
 - **Stabilized footage** with black borders is handled automatically — no need to crop first
 
