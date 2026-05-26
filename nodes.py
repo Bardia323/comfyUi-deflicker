@@ -125,4 +125,13 @@ class DeflickerFrames:
                 grid_size=smooth_grid, content_mask=content_mask,
             )
 
+        # Force aggressive garbage collection and clear PyTorch caching allocator
+        # before returning control to ComfyUI's execution engine
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+
         return (corrected, heatmap)

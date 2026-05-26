@@ -650,11 +650,9 @@ def deflicker_frames(
     do_temporal = mode in ("temporal_smoothing", "both")
 
     corrected = images
-    # Track whether `corrected` is a buffer we own (a fresh allocation) versus
-    # still the caller's input tensor. Once we own it we mutate in place, which
-    # avoids holding two full-size [N,H,W,3] copies at the peak of each phase —
-    # the difference between fitting in RAM and crashing on long clips.
-    owns_buffer = False
+    # We mutate in place by default to completely avoid holding two full-size
+    # [N, H, W, 3] copies of the video in host RAM.
+    owns_buffer = True
 
     def _apply_gain(buf, gain_map, owns):
         """Multiply the full frame buffer by a broadcast gain map, in place
@@ -677,12 +675,18 @@ def deflicker_frames(
             corrected, owns_buffer = _apply_gain(corrected, gain_map, owns_buffer)
             del gain_map
         else:
-            corrected = corrected.clone()
-            owns_buffer = True
             for ch in range(3):
                 corrected[..., ch] = _remove_steps(
                     corrected[..., ch], content_mask, strength=strength,
                 ).clamp(0.0, 1.0)
+        
+        # Aggressive garbage collection
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
 
     # --- Phase 1: Per-frame statistics correction (temporal smoothing) ---
     if do_temporal:
@@ -713,13 +717,18 @@ def deflicker_frames(
             corrected, owns_buffer = _apply_gain(corrected, gain_map, owns_buffer)
             del gain_map
         else:
-            tmp = corrected.clone()
             for ch in range(3):
-                tmp[..., ch] = correct_fn(
+                corrected[..., ch] = correct_fn(
                     corrected[..., ch], window_size, strength, smooth_fn, has_trend,
-                )
-            corrected = tmp.clamp(0.0, 1.0)
-            owns_buffer = True
+                ).clamp(0.0, 1.0)
+        
+        # Aggressive garbage collection
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
 
     # --- Phase 2: Per-pixel temporal smoothing (optional) ---
     if pixel_smoothing > 0 and do_temporal:
@@ -730,6 +739,14 @@ def deflicker_frames(
             inplace=owns_buffer,
         )
         corrected.clamp_(0.0, 1.0)
+        
+        # Aggressive garbage collection
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
 
     if gen_heatmap:
         heatmap = _generate_correction_heatmap(corrected, images)
@@ -742,15 +759,33 @@ def _generate_correction_heatmap(
     corrected: torch.Tensor, original: torch.Tensor,
 ) -> torch.Tensor:
     """Blue-black-red heatmap from brightness difference."""
-    diff = corrected.mean(dim=-1) - original.mean(dim=-1)
-    B, H, W = diff.shape
-    device = diff.device
-    max_abs = diff.abs().max()
-    if max_abs < 1e-6:
-        return torch.zeros(B, H, W, 3, device=device)
+    B, H, W, C = corrected.shape
+    device = corrected.device
+    
+    # Compute max_abs incrementally in chunks to avoid memory spikes
+    chunk_size = 32
+    max_abs = 0.0
+    for i in range(0, B, chunk_size):
+        c_chunk = corrected[i:i+chunk_size]
+        o_chunk = original[i:i+chunk_size]
+        diff_chunk = c_chunk.mean(dim=-1) - o_chunk.mean(dim=-1)
+        max_abs = max(max_abs, diff_chunk.abs().max().item())
+        del diff_chunk
 
-    normalized = diff / max_abs
-    heatmap = torch.zeros(B, H, W, 3, device=device)
-    heatmap[..., 0] = normalized.clamp(min=0)
-    heatmap[..., 2] = (-normalized).clamp(min=0)
+    heatmap = torch.zeros(B, H, W, 3, dtype=corrected.dtype, device=device)
+    if max_abs < 1e-6:
+        return heatmap
+
+    # Populate heatmap incrementally
+    for i in range(0, B, chunk_size):
+        c_chunk = corrected[i:i+chunk_size]
+        o_chunk = original[i:i+chunk_size]
+        diff_chunk = c_chunk.mean(dim=-1) - o_chunk.mean(dim=-1)
+        normalized = diff_chunk / max_abs
+        
+        heatmap[i:i+chunk_size, ..., 0] = normalized.clamp(min=0)
+        heatmap[i:i+chunk_size, ..., 2] = (-normalized).clamp(min=0)
+        
+        del diff_chunk, normalized
+
     return heatmap
