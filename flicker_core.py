@@ -13,6 +13,21 @@ import torch
 import torch.nn.functional as F
 
 
+def _safe_empty_cache():
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Border masking — exclude black bars from statistics
 # ---------------------------------------------------------------------------
@@ -681,12 +696,7 @@ def deflicker_frames(
                 ).clamp(0.0, 1.0)
         
         # Aggressive garbage collection
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
+        _safe_empty_cache()
 
     # --- Phase 1: Per-frame statistics correction (temporal smoothing) ---
     if do_temporal:
@@ -723,12 +733,7 @@ def deflicker_frames(
                 ).clamp(0.0, 1.0)
         
         # Aggressive garbage collection
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
+        _safe_empty_cache()
 
     # --- Phase 2: Per-pixel temporal smoothing (optional) ---
     if pixel_smoothing > 0 and do_temporal:
@@ -741,12 +746,7 @@ def deflicker_frames(
         corrected.clamp_(0.0, 1.0)
         
         # Aggressive garbage collection
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
+        _safe_empty_cache()
 
     if gen_heatmap:
         heatmap = _generate_correction_heatmap(corrected, images)
